@@ -2,8 +2,10 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
+#include <nvToolsExt.h>
 
 std::vector<float> GaussianKernel(int size, float sigma){ 
+    nvtxRangePush("Kernel_Gaussa"); 
     std::vector<float> kernel(size);
     int center= size/2;
     float sum= 0;
@@ -15,6 +17,7 @@ std::vector<float> GaussianKernel(int size, float sigma){
     }
 
     for(int i=0;i<size;i++){ kernel[i] = kernel[i]/sum;}
+    nvtxRangePop();
     return kernel;
 }
 
@@ -38,7 +41,6 @@ __global__ void Horizontal(uchar3* in, uchar3* out, float* kernel, int width, in
         sumR = sumR+pixel.z*kernel[i];
     }
     out[y*width+x] = make_uchar3(sumB,sumG,sumR);
-
 }
 __global__ void Vertical(uchar3* in, uchar3* out, float* kernel, int width, int height, int ksize) {
     int x= blockIdx.x* blockDim.x+ threadIdx.x;
@@ -64,6 +66,7 @@ __global__ void Vertical(uchar3* in, uchar3* out, float* kernel, int width, int 
 }
 
 int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
+    nvtxRangePush("FastCV");
     int height= source.rows;
     int width= source.cols;
 
@@ -74,6 +77,7 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
     size_t imgSize= width* height* sizeof(uchar3);
 
 //To do zostawienia już w spokoju
+    nvtxRangePush("Alokacja"); //Al
     cudaError_t err = cudaMalloc(&d_input, imgSize);
     if (err!= cudaSuccess){
         printf("cudaMalloc d_input failed: %s\n", cudaGetErrorString(err));
@@ -94,6 +98,8 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
         printf("cudaMalloc d_kernel failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+    nvtxRangePush("H2D");
     err = cudaMemcpy(d_input, source.ptr(), imgSize, cudaMemcpyHostToDevice);
     if (err!= cudaSuccess){
         printf("cudaMempcpy H2D d_input failed: %s\n", cudaGetErrorString(err));
@@ -104,42 +110,49 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
         printf("cudaMempcy H2D d_kernel failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
     cudaGetLastError(); // Clear any previous errors - czysci spis bledow
-    
     dim3 block(16,16);
     dim3 grid((width+ block.x-1)/ block.x, (height+ block.y-1)/ block.y);
-
+    nvtxRangePush("Konwolucja_H");
     Horizontal<<<grid, block>>>(d_input, d_temp, d_kernel, width, height, size);
     err = cudaGetLastError();
     if (err != cudaSuccess) { // Error horizontal kernela
         printf("Kernel Horizontal launch error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+    nvtxRangePush("Konwolucja_W");
     Vertical<<<grid, block>>>(d_temp, d_output, d_kernel, width, height, size);
     err = cudaGetLastError(); //Error vertical kernela
     if (err != cudaSuccess) {
         printf("Kernel Vertical error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
     //Wait for kernel to complete - Sprawdzenie czy kernele się wykonały
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         printf("Kernel execution error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePush("D2H");
     final.create(source.size(), source.type());
     err = cudaMemcpy(final.ptr(), d_output, imgSize, cudaMemcpyDeviceToHost);
         if (err!= cudaSuccess){
-        printf("cudaMempcy H2D final failed: %s\n", cudaGetErrorString(err));
+        printf("cudaMempcy D2H final failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
-
+    nvtxRangePop();
+    nvtxRangePush("Czyszczenie");
     //Cleanup
     cudaFree(d_input);
     cudaFree(d_temp);
     cudaFree(d_output);
     cudaFree(d_kernel);
+    nvtxRangePop();
 
+    nvtxRangePop();
     return 0;
 //Już git tu wszystko
 }
