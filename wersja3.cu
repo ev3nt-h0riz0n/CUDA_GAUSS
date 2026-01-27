@@ -1,4 +1,4 @@
-%%writefile porownanie.cu
+%%writefile wersja3.cu
 
 #include <iostream>
 #include <opencv2/opencv.hpp>
@@ -13,12 +13,13 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/execution_policy.h>
 #include <nvtx3/nvToolsExt.h>
+#include <cuda_profiler_api.h>
 
 
 struct Gauss_gen{
     thrust::pair<int,float> gauss_pair; //1-center,2-sigma 
 
-    __host__ __device__ float operator()(int i){
+    __device__ float operator()(int i){
         int x=i-gauss_pair.first;
         return exp(-(x*x)/(2.0f*gauss_pair.second*gauss_pair.second));
     }
@@ -28,7 +29,7 @@ struct Gauss_gen_norm{
     thrust::pair<int,float> gauss_pair; //1-center,2-sigma 
     float sum;
 
-    __host__ __device__ float operator()(int i){
+    __device__ float operator()(int i){
         int x=i-gauss_pair.first;
         float gauss=exp(-(x*x)/(2.0f*gauss_pair.second*gauss_pair.second));
         return gauss/sum;
@@ -102,6 +103,7 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, cv::Size size, float sigm
     int center_x=size.width/2;
     int center_y=size.height/2;
 
+    nvtxRangePush("Tworzenie Kernela");
     thrust::device_vector<float> d_kernel_x(size.width);
 
     thrust::counting_iterator<int> count(0);
@@ -118,13 +120,14 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, cv::Size size, float sigm
 
     thrust::transform(thrust::device,count,count+size.height,d_kernel_y.begin(),Gauss_gen_norm{thrust::make_pair(center_y,sigma),sum_y});
     float* d_kernel_yy=thrust::raw_pointer_cast(d_kernel_y.data());
-
+    nvtxRangePop();
 
     uchar3 *d_input, *d_temp, *d_output;
 
     size_t imgSize= width* height* sizeof(uchar3);
 
 //To do zostawienia już w spokoju
+    nvtxRangePush("Alokacja");
     cudaError_t err = cudaMalloc(&d_input, imgSize);
     if (err!= cudaSuccess){
         printf("cudaMalloc d_input failed: %s\n", cudaGetErrorString(err));
@@ -140,45 +143,61 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, cv::Size size, float sigm
         printf("cudaMalloc d_output failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+    nvtxRangePush("H2D");
     err = cudaMemcpy(d_input, source.ptr(), imgSize, cudaMemcpyHostToDevice);
     if (err!= cudaSuccess){
         printf("cudaMempcpy H2D d_input failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
     cudaGetLastError(); // Clear any previous errors - czysci spis bledow
-
+    nvtxRangePush();
     dim3 block(16,16);
     dim3 grid((width+ block.x-1)/ block.x, (height+ block.y-1)/ block.y);
 
+    nvtxRangePush("Konwolucja_H");
     Horizontal<<<grid, block>>>(d_input, d_temp, d_kernel_xx, width, height, size.width);
     err = cudaGetLastError();
     if (err != cudaSuccess) { // Error horizontal kernela
         printf("Kernel Horizontal launch error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+    
+    nvtxRangePush("Konwolucja_W");
     Vertical<<<grid, block>>>(d_temp, d_output, d_kernel_yy, width, height, size.height);
     err = cudaGetLastError(); //Error vertical kernela
     if (err != cudaSuccess) {
         printf("Kernel Vertical error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+
+    nvtxRangePush("Synchronizacja");
     //Wait for kernel to complete - Sprawdzenie czy kernele się wykonały
     err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         printf("Kernel execution error: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
+
+    nvtxRangePush("D2H");
     final.create(source.size(), source.type());
     err = cudaMemcpy(final.ptr(), d_output, imgSize, cudaMemcpyDeviceToHost);
         if (err!= cudaSuccess){
-        printf("cudaMempcy H2D final failed: %s\n", cudaGetErrorString(err));
+        printf("cudaMempcy D2H final failed: %s\n", cudaGetErrorString(err));
         return 1;
     }
+    nvtxRangePop();
 
+    nvtxRangePush("Czyszczenie");
     //Cleanup
     cudaFree(d_input);
     cudaFree(d_temp);
     cudaFree(d_output);
+    nvtxRangePop();
 
     return 0;
 //Już git tu wszystko
@@ -187,24 +206,29 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, cv::Size size, float sigm
 
 int main()
 {
+cudaProfilerStop();
   // Obliczanie czasu przetwarzania obrazu dla CPU (opencv)
   cv::Mat zdj = cv::imread("test (2).jpg");
   cv::Mat zdj_opencv;
   cv::Mat zdj_fastcv;
 
   auto start = std::chrono::high_resolution_clock::now();
-  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(23,23), 10);
+  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(7,7), 10);
   auto end = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffOpen = end - start;
   std::cout<<"Czas wykonania OpenCV: " << diffOpen.count() << "s\n";
-  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(23,23),10);
+
+  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(7,7),10);
+
+  cudaProfilerStart();
   auto start2 = std::chrono::high_resolution_clock::now();
-  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(23,23),10);
+  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(7,7),10);
   auto end2 = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffFast = end2 - start2;
   std::cout<<"Czas wykonania FastCV: " << diffFast.count() << "s\n";
+  cudaProfilerStop();
 
   cv::imwrite("zdj_opencv.jpg", zdj_opencv);
   cv::imwrite("zdj_fastcv.jpg", zdj_fastcv);
