@@ -1,102 +1,176 @@
-%%writefile wersja1.cu
+%%writefile wersja2.cu
 
-#include <iostream>
 #include <opencv2/opencv.hpp>
-#include <chrono>
-#include <cmath>
+#include <cuda_runtime.h>
+#include <iostream>
 #include <vector>
-#include <algorithm>
 #include <nvToolsExt.h>
+#include <thrust/device_vector.h>
+#include <cuda_profiler_api.h>
 
+std::vector<float> GaussianKernel(int size, float sigma){
+    std::vector<float> kernel(size);
+    int center= size/2;
+    float sum= 0;
 
-
-std::vector<std::vector<double>> GaussianKernel(int height,int width,double sigma) //Utworzenie kernela
-{
-    nvtxRangePush("Tworzenie_Kernela");
-    std::vector<std::vector<double>> kernel(height, std::vector<double>(width)); //device_vector tu
-    double sum=0.0;
-    int half_width=width/2;
-    int half_height=height/2;
-
-    for(int row=0; row<height; row++){ //petla liczaca macierz do filtru
-        for (int col=0; col<width; col++)
-        {
-            int matrix_x=col-half_width;
-            int matrix_y=row-half_height;
-
-            kernel[row][col]= (1/(2*M_PI*sigma*sigma))*exp(-(matrix_x*matrix_x+matrix_y*matrix_y)/(2*sigma*sigma)); //Wzor Gaussa
-            sum= sum+kernel[row][col];
-
-
-        }
-    } for(int row=0; row<height; row++){ //petla normalizujaca
-        for (int col=0; col<width; col++)
-        {
-            kernel[row][col]=kernel[row][col]/sum;
-        }
+    for(int i=0;i<size; i++) {
+        int x = i-center;
+        kernel[i] = exp(-(x*x)/(2.0f*sigma*sigma));
+        sum= sum+ kernel[i];
     }
-    nvtxRangePop();
+
+    for(int i=0;i<size;i++){ kernel[i] = kernel[i]/sum;}
     return kernel;
 }
 
-void GaussianBlurFastCV(cv::Mat& source_picture,cv::Mat& final_picture,cv::Size kernelSize,float sigma) //glowna funckja zamazania Gaussowskiego
-{
-    nvtxRangePush("FastCV");
-    int height= source_picture.rows;
-    int width= source_picture.cols;
+__global__ void Horizontal(uchar3* in, uchar3* out, float* kernel, int width, int height, int ksize) {
+    int x= blockIdx.x* blockDim.x+ threadIdx.x;
+    int y= blockIdx.y* blockDim.y+ threadIdx.y;
 
-    final_picture.create(source_picture.size(), source_picture.type());
+    if(x>=width || y>=height) return;
 
-    std::vector<std::vector<double>> kernel = GaussianKernel(kernelSize.height, kernelSize.width, sigma);
+    int half = ksize/2;
+    float sumR= 0, sumG=0, sumB=0;
 
-    nvtxRangePush("Konwolucja");
-    int half_width=kernelSize.width/2;
-    int half_height=kernelSize.height/2;
+    for(int i=0; i<ksize;i++){
+        int px= x+(i-half);
+        if(px<0) px=0;
+        if(px>=width) px=width-1;
 
-    for(int row=0; row<height; row++){ //petla przechodzenia przez piksele zdjecia
-        for (int col=0; col<width; col++){
+        uchar3 pixel=in[y*width+px];
+        sumB= sumB+pixel.x*kernel[i];
+        sumG= sumG+ pixel.y*kernel[i];
+        sumR = sumR+pixel.z*kernel[i];
+    }
+    out[y*width+x] = make_uchar3(sumB,sumG,sumR);
+}
+__global__ void Vertical(uchar3* in, uchar3* out, float* kernel, int width, int height, int ksize) {
+    int x= blockIdx.x* blockDim.x+ threadIdx.x;
+    int y= blockIdx.y* blockDim.y+ threadIdx.y;
 
-            double sumR=0.0;
-            double sumG=0.0;
-            double sumB=0.0;
+    if(x>=width || y>=height) return;
 
-            for(int kernel_row=0; kernel_row<kernelSize.height; kernel_row++){ //petla przechodzenia przez piksele kernela
-                for (int kernel_col=0; kernel_col<kernelSize.width; kernel_col++){
-                    int pct_row=row+(kernel_row-half_height);
-                    int pct_col= col+(kernel_col-half_width);
+    int half = ksize/2;
+    float sumR= 0, sumG=0, sumB=0;
 
-                    if(pct_row<0) pct_row=0;
-                    if(pct_row>=height)pct_row=height-1;
-                    if(pct_col<0) pct_col=0;
-                    if(pct_col>=width)pct_col=width-1;
+    for(int i=0; i<ksize;i++){
+        int py= y+(i-half);
+        if(py<0) py=0;
+        if(py>=height) py=height-1;
 
-                    cv::Vec3b pixel=source_picture.at<cv::Vec3b>(pct_row,pct_col);
-                    double weight = kernel[kernel_row][kernel_col];
+        uchar3 pixel=in[py*width+x];
 
-                    sumB+=pixel[0]*weight;
-                    sumG+=pixel[1]*weight;
-                    sumR+=pixel[2]*weight;
+        sumB= sumB+pixel.x*kernel[i];
+        sumG= sumG+ pixel.y*kernel[i];
+        sumR = sumR+pixel.z*kernel[i];
+    }
+    out[y*width+x] = make_uchar3(sumB,sumG,sumR);
+}
 
-                }
-            }
-        cv::Vec3b new_pixel;
-        new_pixel[0]=cv::saturate_cast<uchar>(sumB);
-        new_pixel[1]=cv::saturate_cast<uchar>(sumG);
-        new_pixel[2]=cv::saturate_cast<uchar>(sumR);
-        final_picture.at<cv::Vec3b>(row,col)=new_pixel;
-        }
+int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
+    int height= source.rows;
+    int width= source.cols;
 
+    std::vector<float> kernel= GaussianKernel(size,sigma);
+    uchar3 *d_input, *d_temp, *d_output;
+    float* d_kernel;
+
+    size_t imgSize= width* height* sizeof(uchar3);
+
+//To do zostawienia już w spokoju
+    nvtxRangePush("Alokacja"); //Al
+    cudaError_t err = cudaMalloc(&d_input, imgSize);
+    if (err!= cudaSuccess){
+        printf("cudaMalloc d_input failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    err = cudaMalloc(&d_temp, imgSize);
+    if (err!= cudaSuccess){
+        printf("cudaMalloc d_temp failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    err =cudaMalloc(&d_output, imgSize);
+    if (err!= cudaSuccess){
+        printf("cudaMalloc d_output failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    err = cudaMalloc(&d_kernel, size* sizeof(float));
+    if (err!= cudaSuccess){
+        printf("cudaMalloc d_kernel failed: %s\n", cudaGetErrorString(err));
+        return 1;
     }
     nvtxRangePop();
+    nvtxRangePush("H2D");
+    err = cudaMemcpy(d_input, source.ptr(), imgSize, cudaMemcpyHostToDevice);
+    if (err!= cudaSuccess){
+        printf("cudaMempcpy H2D d_input failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    err = cudaMemcpy(d_kernel, kernel.data(), size* sizeof(float), cudaMemcpyHostToDevice);
+        if (err!= cudaSuccess){
+        printf("cudaMempcy H2D d_kernel failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
     nvtxRangePop();
+    cudaGetLastError(); // Clear any previous errors - czysci spis bledow
+    dim3 block(16,16);
+    dim3 grid((width+ block.x-1)/ block.x, (height+ block.y-1)/ block.y);
+    nvtxRangePush("Konwolucja_H");
+    Horizontal<<<grid, block>>>(d_input, d_temp, d_kernel, width, height, size);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) { // Error horizontal kernela
+        printf("Kernel Horizontal launch error: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    nvtxRangePop();
+    nvtxRangePush("Konwolucja_W");
+    Vertical<<<grid, block>>>(d_temp, d_output, d_kernel, width, height, size);
+    err = cudaGetLastError(); //Error vertical kernela
+    if (err != cudaSuccess) {
+        printf("Kernel Vertical error: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    nvtxRangePop();
+    //Wait for kernel to complete - Sprawdzenie czy kernele się wykonały
+    nvtxRangePush("Synchronizacja");
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("Kernel execution error: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    nvtxRangePop();
+    nvtxRangePush("D2H");
+    final.create(source.size(), source.type());
+    err = cudaMemcpy(final.ptr(), d_output, imgSize, cudaMemcpyDeviceToHost);
+        if (err!= cudaSuccess){
+        printf("cudaMempcy D2H final failed: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    nvtxRangePop();
+    nvtxRangePush("Czyszczenie");
+    //Cleanup
+    cudaFree(d_input);
+    cudaFree(d_temp);
+    cudaFree(d_output);
+    cudaFree(d_kernel);
+    nvtxRangePop();
+
+    return 0;
+//Już git tu wszystko
 }
 
 int main()
 {
+  cudaProfilerStop();
   // Obliczanie czasu przetwarzania obrazu dla CPU (opencv)
-  cv::Mat zdj = cv::imread("test.jpg", cv::IMREAD_COLOR);
+  cv::Mat zdj = cv::imread("test.jpg");
   cv::Mat zdj_opencv;
   cv::Mat zdj_fastcv;
+
+
+
+  GaussianBlurFastCV(zdj, zdj_fastcv,7,10);
+
 
   auto start = std::chrono::high_resolution_clock::now();
   cv::GaussianBlur(zdj, zdj_opencv, cv::Size(7,7), 10);
@@ -105,14 +179,17 @@ int main()
   std::chrono::duration<double> diffOpen = end - start;
   std::cout<<"Czas wykonania OpenCV: " << diffOpen.count() << "s\n";
 
+  cudaProfilerStart();
   auto start2 = std::chrono::high_resolution_clock::now();
-  GaussianBlurFastCV(zdj, zdj_fastcv, cv::Size(7,7),10);
+  GaussianBlurFastCV(zdj, zdj_fastcv,7,10);
   auto end2 = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffFast = end2 - start2;
   std::cout<<"Czas wykonania FastCV: " << diffFast.count() << "s\n";
+  cudaProfilerStop();
 
   cv::imwrite("zdj_opencv.jpg", zdj_opencv);
   cv::imwrite("zdj_fastcv.jpg", zdj_fastcv);
+
   return 0;
 }
