@@ -1,11 +1,14 @@
+%%writefile wersja2.cu
+
 #include <opencv2/opencv.hpp>
 #include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
 #include <nvToolsExt.h>
+#include <thrust/device_vector.h>
+#include <cuda_profiler_api.h>
 
-std::vector<float> GaussianKernel(int size, float sigma){ 
-    nvtxRangePush("Kernel_Gaussa"); 
+std::vector<float> GaussianKernel(int size, float sigma){
     std::vector<float> kernel(size);
     int center= size/2;
     float sum= 0;
@@ -17,7 +20,6 @@ std::vector<float> GaussianKernel(int size, float sigma){
     }
 
     for(int i=0;i<size;i++){ kernel[i] = kernel[i]/sum;}
-    nvtxRangePop();
     return kernel;
 }
 
@@ -66,7 +68,6 @@ __global__ void Vertical(uchar3* in, uchar3* out, float* kernel, int width, int 
 }
 
 int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
-    nvtxRangePush("FastCV");
     int height= source.rows;
     int width= source.cols;
 
@@ -131,11 +132,9 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
     }
     nvtxRangePop();
     //Wait for kernel to complete - Sprawdzenie czy kernele się wykonały
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("Kernel execution error: %s\n", cudaGetErrorString(err));
-        return 1;
-    }
+    nvtxRangePush("Synchronizacja");
+
+    nvtxRangePop();
     nvtxRangePush("D2H");
     final.create(source.size(), source.type());
     err = cudaMemcpy(final.ptr(), d_output, imgSize, cudaMemcpyDeviceToHost);
@@ -152,31 +151,38 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
     cudaFree(d_kernel);
     nvtxRangePop();
 
-    nvtxRangePop();
     return 0;
 //Już git tu wszystko
 }
 
 int main()
 {
+  cudaProfilerStop();
   // Obliczanie czasu przetwarzania obrazu dla CPU (opencv)
-  cv::Mat zdj = cv::imread("test (2).jpg");
+  cv::Mat zdj = cv::imread("test.jpg");
   cv::Mat zdj_opencv;
   cv::Mat zdj_fastcv;
 
+
+
+  GaussianBlurFastCV(zdj, zdj_fastcv,7,10);
+
+
   auto start = std::chrono::high_resolution_clock::now();
-  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(23,23), 10);
+  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(7,7), 10);
   auto end = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffOpen = end - start;
   std::cout<<"Czas wykonania OpenCV: " << diffOpen.count() << "s\n";
 
+  cudaProfilerStart();
   auto start2 = std::chrono::high_resolution_clock::now();
-  GaussianBlurFastCV(zdj, zdj_fastcv,23,10);
+  GaussianBlurFastCV(zdj, zdj_fastcv,7,10);
   auto end2 = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffFast = end2 - start2;
   std::cout<<"Czas wykonania FastCV: " << diffFast.count() << "s\n";
+  cudaProfilerStop();
 
   cv::imwrite("zdj_opencv.jpg", zdj_opencv);
   cv::imwrite("zdj_fastcv.jpg", zdj_fastcv);
