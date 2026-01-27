@@ -11,29 +11,45 @@
 #include <thrust/reduce.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/execution_policy.h>
 #include <nvtx3/nvToolsExt.h>
 
+
 struct Gauss_gen{
-    int center;
-    float sigma;
+    thrust::pair<int,float> gauss_pair; //1-center,2-sigma 
 
     __host__ __device__ float operator()(int i){
-        int x=i-center;
-        return exp(-(x*x)/(2.0f*sigma*sigma));
+        int x=i-gauss_pair.first;
+        return exp(-(x*x)/(2.0f*gauss_pair.second*gauss_pair.second));
     }
 };
 
 struct Gauss_gen_norm{
-    int center;
-    float sigma;
+    thrust::pair<int,float> gauss_pair; //1-center,2-sigma 
     float sum;
 
     __host__ __device__ float operator()(int i){
-        int x=i-center;
-        float gauss=exp(-(x*x)/(2.0f*sigma*sigma));
+        int x=i-gauss_pair.first;
+        float gauss=exp(-(x*x)/(2.0f*gauss_pair.second*gauss_pair.second));
         return gauss/sum;
     }
 };
+
+
+std::vector<float> GaussianKernel(int size, float sigma){
+    std::vector<float> kernel(size);
+    int center= size/2;
+    float sum= 0;
+
+    for(int i=0;i<size; i++) {
+        int x = i-center;
+        kernel[i] = exp(-(x*x)/(2.0f*sigma*sigma));
+        sum= sum+ kernel[i];
+    }
+
+    for(int i=0;i<size;i++){ kernel[i] = kernel[i]/sum;}
+    return kernel;
+}
 
 __global__ void Horizontal(uchar3* in, uchar3* out, float* kernel, int width, int height, int ksize) {
     int x= blockIdx.x* blockDim.x+ threadIdx.x;
@@ -80,19 +96,30 @@ __global__ void Vertical(uchar3* in, uchar3* out, float* kernel, int width, int 
     out[y*width+x] = make_uchar3(sumB,sumG,sumR);
 }
 
-int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
+int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, cv::Size size, float sigma){
     int height= source.rows;
     int width= source.cols;
-    int center=size/2;
+    int center_x=size.width/2;
+    int center_y=size.height/2;
 
-    thrust::device_vector<float> d_kernel_vec(size);
+    thrust::device_vector<float> d_kernel_x(size.width);
 
     thrust::counting_iterator<int> count(0);
-    auto gauss_vec=thrust::make_transform_iterator(count,Gauss_gen{center,sigma});//generuje wektor z wartosciami gaussa
-    float sum=thrust::reduce(gauss_vec,gauss_vec+size);//suma wektora
+    auto gauss_vec_x=thrust::make_transform_iterator(count,Gauss_gen{thrust::make_pair(center_x,sigma)});//generuje wektor z wartosciami gaussa
+    float sum_x=thrust::reduce(thrust::device,gauss_vec_x,gauss_vec_x+size.width);//suma wektora
 
-    thrust::transform(count,count+size,d_kernel_vec.begin(),Gauss_gen_norm{size/2,sigma,sum});
-    float* d_kernel=thrust::raw_pointer_cast(d_kernel_vec.data());
+    thrust::transform(thrust::device,count,count+size.width,d_kernel_x.begin(),Gauss_gen_norm{thrust::make_pair(center_x,sigma),sum_x});
+    float* d_kernel_xx=thrust::raw_pointer_cast(d_kernel_x.data());
+
+    thrust::device_vector<float> d_kernel_y(size.height);
+
+    auto gauss_vec_y=thrust::make_transform_iterator(count,Gauss_gen{thrust::make_pair(center_y,sigma)});//generuje wektor z wartosciami gaussa
+    float sum_y=thrust::reduce(thrust::device,gauss_vec_y,gauss_vec_y+size.height);//suma wektora
+
+    thrust::transform(thrust::device,count,count+size.height,d_kernel_y.begin(),Gauss_gen_norm{thrust::make_pair(center_y,sigma),sum_y});
+    float* d_kernel_yy=thrust::raw_pointer_cast(d_kernel_y.data());
+
+
     uchar3 *d_input, *d_temp, *d_output;
 
     size_t imgSize= width* height* sizeof(uchar3);
@@ -123,13 +150,13 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
     dim3 block(16,16);
     dim3 grid((width+ block.x-1)/ block.x, (height+ block.y-1)/ block.y);
 
-    Horizontal<<<grid, block>>>(d_input, d_temp, d_kernel, width, height, size);
+    Horizontal<<<grid, block>>>(d_input, d_temp, d_kernel_xx, width, height, size.width);
     err = cudaGetLastError();
     if (err != cudaSuccess) { // Error horizontal kernela
         printf("Kernel Horizontal launch error: %s\n", cudaGetErrorString(err));
         return 1;
     }
-    Vertical<<<grid, block>>>(d_temp, d_output, d_kernel, width, height, size);
+    Vertical<<<grid, block>>>(d_temp, d_output, d_kernel_yy, width, height, size.height);
     err = cudaGetLastError(); //Error vertical kernela
     if (err != cudaSuccess) {
         printf("Kernel Vertical error: %s\n", cudaGetErrorString(err));
@@ -161,7 +188,7 @@ int GaussianBlurFastCV(cv::Mat& source,cv::Mat& final, int size, float sigma){
 int main()
 {
   // Obliczanie czasu przetwarzania obrazu dla CPU (opencv)
-  cv::Mat zdj = cv::imread("test1.jpg");
+  cv::Mat zdj = cv::imread("test (2).jpg");
   cv::Mat zdj_opencv;
   cv::Mat zdj_fastcv;
 
@@ -171,9 +198,9 @@ int main()
 
   std::chrono::duration<double> diffOpen = end - start;
   std::cout<<"Czas wykonania OpenCV: " << diffOpen.count() << "s\n";
-
+  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(23,23),10);
   auto start2 = std::chrono::high_resolution_clock::now();
-  GaussianBlurFastCV(zdj, zdj_fastcv,23,10);
+  GaussianBlurFastCV(zdj, zdj_fastcv,cv::Size(23,23),10);
   auto end2 = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffFast = end2 - start2;
