@@ -99,14 +99,14 @@ int main()
   cv::Mat zdj_fastcv;
 
   auto start = std::chrono::high_resolution_clock::now();
-  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(7,7), 10);
+  cv::GaussianBlur(zdj, zdj_opencv, cv::Size(33,33), 10);
   auto end = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffOpen = end - start;
   std::cout<<"Czas wykonania OpenCV: " << diffOpen.count() << "s\n";
 
   auto start2 = std::chrono::high_resolution_clock::now();
-  GaussianBlurFastCV(zdj, zdj_fastcv, cv::Size(7,7),10);
+  GaussianBlurFastCV(zdj, zdj_fastcv, cv::Size(33,33),10);
   auto end2 = std::chrono::high_resolution_clock::now();
 
   std::chrono::duration<double> diffFast = end2 - start2;
